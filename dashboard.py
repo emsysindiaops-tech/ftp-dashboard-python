@@ -69,17 +69,24 @@ except ImportError:
     print("Missing dependency. Run:  pip install python-dotenv")
     sys.exit(1)
 
+# SCRIPT_DIR = Path(__file__).resolve().parent
+# ENV_PATH = SCRIPT_DIR / ".env"
+
+# if not ENV_PATH.exists():
+#     print(
+#         f"No .env file found at {ENV_PATH}\n"
+#         f"Copy .env.template to .env and fill in your credentials first."
+#     )
+#     sys.exit(1)
+
+# load_dotenv(ENV_PATH)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 
-if not ENV_PATH.exists():
-    print(
-        f"No .env file found at {ENV_PATH}\n"
-        f"Copy .env.template to .env and fill in your credentials first."
-    )
-    sys.exit(1)
-
-load_dotenv(ENV_PATH)
+# Load local .env only if it exists
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 
 
 def env(key, default=None, required=True):
