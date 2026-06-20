@@ -1,0 +1,55 @@
+# render.yaml — Infrastructure-as-code config for Render.
+#
+# This lets you deploy by connecting your GitHub repo to Render and having
+# it auto-detect this file, OR you can skip this file entirely and just
+# configure the same settings manually in the Render dashboard (see
+# RENDER_DEPLOY.md for the manual click-by-click steps).
+#
+# IMPORTANT: This file does NOT contain your FTP credentials. Those must be
+# added as environment variables in the Render dashboard (Settings ->
+# Environment), exactly like your local .env file, but entered through
+# Render's UI instead of a file — never commit a .env file with real
+# credentials to a public GitHub repo.
+
+services:
+  - type: web
+    name: ampin-ftg-4-dashboard
+    runtime: python
+    plan: starter          # ~$7/mo, always-on (no cold-start sleep)
+    region: singapore       # closest available Render region to India as of
+                             # writing; change if a closer one becomes available
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn dashboard:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: SECI3_HOST
+        sync: false
+      - key: SECI3_PORT
+        sync: false
+      - key: SECI3_USER
+        sync: false
+      - key: SECI3_PASS
+        sync: false
+      - key: SECI3_REMOTE_DIR
+        sync: false
+      - key: CNI_HOST
+        sync: false
+      - key: CNI_PORT
+        sync: false
+      - key: CNI_USER
+        sync: false
+      - key: CNI_PASS
+        sync: false
+      - key: CNI_REMOTE_DIR
+        sync: false
+      - key: SECI5_HOST
+        sync: false
+      - key: SECI5_PORT
+        sync: false
+      - key: SECI5_USER
+        sync: false
+      - key: SECI5_PASS
+        sync: false
+      - key: SECI5_REMOTE_DIR
+        sync: false
+      - key: POLL_INTERVAL_MINUTES
+        value: "15"
