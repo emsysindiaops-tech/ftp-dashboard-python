@@ -69,24 +69,25 @@ except ImportError:
     print("Missing dependency. Run:  pip install python-dotenv")
     sys.exit(1)
 
-# SCRIPT_DIR = Path(__file__).resolve().parent
-# ENV_PATH = SCRIPT_DIR / ".env"
-
-# if not ENV_PATH.exists():
-#     print(
-#         f"No .env file found at {ENV_PATH}\n"
-#         f"Copy .env.template to .env and fill in your credentials first."
-#     )
-#     sys.exit(1)
-
-# load_dotenv(ENV_PATH)
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 
-# Load local .env only if it exists
+# Load .env if it exists (local development). On hosts like Render, there is
+# no .env file — credentials are injected directly as environment variables
+# via the platform's dashboard, so this is skipped there and that's expected.
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
+
+# Only hard-fail if NEITHER a .env file NOR real environment variables are
+# present — i.e. genuinely unconfigured, whether running locally or deployed.
+if not ENV_PATH.exists() and not os.getenv("SECI3_HOST"):
+    print(
+        "No FTP credentials found.\n"
+        "  - Running locally? Copy .env.template to .env and fill it in.\n"
+        "  - Running on Render (or similar)? Set the credentials as "
+        "environment variables in the platform's dashboard instead."
+    )
+    sys.exit(1)
 
 
 def env(key, default=None, required=True):
@@ -119,9 +120,21 @@ SOURCES = {
         "password": env("SECI5_PASS"),
         "remote_dir": env("SECI5_REMOTE_DIR", "/"),
     },
+    "MSEDCL": {
+        "host": env("MSEDCL_HOST"),
+        "port": int(env("MSEDCL_PORT", "21")),
+        "user": env("MSEDCL_USER"),
+        "password": env("MSEDCL_PASS"),
+        "remote_dir": env("MSEDCL_REMOTE_DIR", "/"),
+    },
 }
 
-SOURCE_DISPLAY_NAMES = {"SECI-3": "SECI-3", "CNI": "C&I", "SECI-5": "SECI-5"}
+SOURCE_DISPLAY_NAMES = {
+    "SECI-3": "SECI-3",
+    "CNI": "C&I",
+    "SECI-5": "SECI-5",
+    "MSEDCL": "MSEDCL 200MW",
+}
 
 POLL_INTERVAL_MINUTES = float(env("POLL_INTERVAL_MINUTES", "15", required=False) or 15)
 
@@ -371,11 +384,135 @@ def load_source_range(source_name: str, from_date: date, to_date: date):
         "from_date": from_date.isoformat(),
         "to_date": to_date.isoformat(),
         "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "timestamps": combined["display_timestamp"].dt.strftime("%Y-%m-%d %H:%M").tolist(),
+        "timestamps": combined["display_timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").tolist(),
         "hybrid": combined["hybrid_mw"].round(3).tolist(),
         "solar": combined["solar_mw"].round(3).tolist(),
         "wind": combined["wind_mw"].round(3).tolist(),
         "_df": combined,  # kept for export use; stripped before jsonify
+    }
+
+
+# Sources that use XLS files (FTP_REPORT DD-MM-YYYY HH_MM_SS.xls pattern)
+XLS_SOURCES = {"SECI-3", "CNI", "SECI-5"}
+
+# Sources that use CSV files (DateDD-MM-YYYY.csv pattern, one file per day)
+CSV_SOURCES = {"MSEDCL"}
+
+
+# --------------------------------------------------------------------------
+# MSEDCL: CSV fetch + parse (completely separate from the XLS pipeline)
+# --------------------------------------------------------------------------
+
+def msedcl_filename_for_date(target_date: date) -> str:
+    """Returns the expected CSV filename for a given date."""
+    return f"Date{target_date.strftime('%d-%m-%Y')}.csv"
+
+
+def parse_msedcl_csv(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Parse MSEDCL's daily CSV file into a DataFrame with columns:
+        timestamp, display_timestamp, plant_active_power_mw
+    File is latin-1 encoded (has degree symbol ° in a header), uses
+    Windows line endings (\r\n), and has no extra header/title row —
+    the very first line is the column header.
+    """
+    df = pd.read_csv(
+        io.BytesIO(file_bytes),
+        encoding="latin-1",
+        sep=",",
+        skipinitialspace=True,
+    )
+    # Strip \r and whitespace from column names (Windows line endings)
+    df.columns = [c.strip().replace('\r', '') for c in df.columns]
+
+    ts_col = "DateAndTime"
+    power_col = "Plant Active Power(MW)"
+
+    if ts_col not in df.columns:
+        raise ValueError(f"Timestamp column '{ts_col}' not found in CSV.")
+    if power_col not in df.columns:
+        raise ValueError(f"Column '{power_col}' not found in CSV.")
+
+    df[ts_col] = df[ts_col].astype(str).str.strip().str.replace('\r', '')
+    timestamps = pd.to_datetime(df[ts_col], format="%d-%m-%Y %H:%M", errors="coerce")
+    power = pd.to_numeric(df[power_col], errors="coerce")
+
+    clean = pd.DataFrame({
+        "timestamp": timestamps,
+        "plant_active_power_mw": power,
+    })
+    clean = clean.dropna(subset=["timestamp"]).sort_values("timestamp")
+    clean["display_timestamp"] = clean["timestamp"] - timedelta(
+        minutes=TIMESTAMP_DISPLAY_OFFSET_MINUTES
+    )
+    return clean
+
+
+def load_msedcl_range(from_date: date, to_date: date):
+    """
+    For MSEDCL: fetches DateDD-MM-YYYY.csv for each day in [from_date, to_date],
+    parses each, and concatenates into one continuous series.
+    """
+    source = SOURCES["MSEDCL"]
+    days = date_range_list(from_date, to_date)
+    if not days:
+        return {"ok": False, "error": "Invalid date range."}
+
+    try:
+        ftp = ftp_connect(source)
+    except Exception as e:
+        return {"ok": False, "error": f"Could not connect/login to MSEDCL: {e}"}
+
+    frames = []
+    files_used = []
+    warnings = []
+
+    try:
+        try:
+            all_files = ftp.nlst()
+        except error_perm as e:
+            return {"ok": False, "error": f"Cannot list remote directory: {e}"}
+
+        for d in days:
+            fname = msedcl_filename_for_date(d)
+            if fname not in all_files:
+                warnings.append(f"No file found for {d.strftime('%d-%m-%Y')} (expected '{fname}')")
+                continue
+            try:
+                file_bytes = fetch_file_bytes(ftp, fname)
+                day_df = parse_msedcl_csv(file_bytes)
+                frames.append(day_df)
+                files_used.append(fname)
+            except Exception as e:
+                warnings.append(f"{fname}: {e}")
+
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            ftp.close()
+
+    if not frames:
+        msg = "No data could be retrieved for the selected range."
+        if warnings:
+            msg += " " + "; ".join(warnings)
+        return {"ok": False, "error": msg}
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+
+    return {
+        "ok": True,
+        "error": None,
+        "files_used": files_used,
+        "warnings": warnings,
+        "from_date": from_date.isoformat(),
+        "to_date": to_date.isoformat(),
+        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamps": combined["display_timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S").tolist(),
+        "plant_power": combined["plant_active_power_mw"].round(3).tolist(),
+        "_df": combined,
+        "_type": "msedcl",
     }
 
 
@@ -464,8 +601,11 @@ def api_data():
     result = {}
     for src in SOURCES:
         from_date, to_date = _parse_range_params(src)
-        data = load_source_range(src, from_date, to_date)
-        data.pop("_df", None)  # not needed by the client
+        if src in CSV_SOURCES:
+            data = load_msedcl_range(from_date, to_date)
+        else:
+            data = load_source_range(src, from_date, to_date)
+        data.pop("_df", None)
         result[src] = data
 
     result["_meta"] = {
@@ -494,7 +634,10 @@ def api_export():
 
     for src in SOURCES:
         from_date, to_date = _parse_range_params(src)
-        data = load_source_range(src, from_date, to_date)
+        if src in CSV_SOURCES:
+            data = load_msedcl_range(from_date, to_date)
+        else:
+            data = load_source_range(src, from_date, to_date)
 
         sheet_title = SOURCE_DISPLAY_NAMES[src][:31]
         ws = wb.create_sheet(title=sheet_title)
@@ -504,13 +647,20 @@ def api_export():
             continue
 
         any_data = True
-        df = data["_df"][["display_timestamp", "hybrid_mw", "solar_mw", "wind_mw"]].copy()
-        df.columns = [
-            "Timestamp",
-            "Hybrid Active Power (MW)",
-            "Solar Active Power (MW)",
-            "Wind Active Power (MW)",
-        ]
+
+        if data.get("_type") == "msedcl":
+            df = data["_df"][["display_timestamp", "plant_active_power_mw"]].copy()
+            df.columns = ["Timestamp", "Plant Active Power (MW)"]
+            col_count = 2
+        else:
+            df = data["_df"][["display_timestamp", "hybrid_mw", "solar_mw", "wind_mw"]].copy()
+            df.columns = [
+                "Timestamp",
+                "Hybrid Active Power (MW)",
+                "Solar Active Power (MW)",
+                "Wind Active Power (MW)",
+            ]
+            col_count = 4
 
         ws.append([f"{SOURCE_DISPLAY_NAMES[src]} — {from_date} to {to_date}"])
         ws.append([])
@@ -518,14 +668,14 @@ def api_export():
         for row in dataframe_to_rows(df, index=False, header=True):
             ws.append(row)
 
-        for col_idx in range(1, 5):
+        for col_idx in range(1, col_count + 1):
             cell = ws.cell(row=header_row_idx, column=col_idx)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = header_align
 
         ws.column_dimensions["A"].width = 18
-        for letter in ["B", "C", "D"]:
+        for letter in ["B", "C", "D"][:col_count - 1]:
             ws.column_dimensions[letter].width = 26
 
     if not any_data:
@@ -728,6 +878,7 @@ PAGE_TEMPLATE = """
   .panel[data-plant="SECI-3"]::before { background: linear-gradient(90deg, #3d3a8c, #6e6bd1); }
   .panel[data-plant="CNI"]::before { background: linear-gradient(90deg, #0f9e95, #4fd6cb); }
   .panel[data-plant="SECI-5"]::before { background: linear-gradient(90deg, #e8910c, #f7b94d); }
+  .panel[data-plant="MSEDCL"]::before { background: linear-gradient(90deg, #7c3aed, #a78bfa); }
 
   .panel-header {
     display: flex;
@@ -747,6 +898,7 @@ PAGE_TEMPLATE = """
   .panel[data-plant="SECI-3"] .panel-title { color: #3d3a8c; }
   .panel[data-plant="CNI"] .panel-title { color: #0f9e95; }
   .panel[data-plant="SECI-5"] .panel-title { color: #c97509; }
+  .panel[data-plant="MSEDCL"] .panel-title { color: #7c3aed; }
 
   .panel-meta {
     font-family: "JetBrains Mono", monospace;
@@ -911,17 +1063,37 @@ PAGE_TEMPLATE = """
       <div class="stat-row" id="stats-SECI-5"></div>
       <div id="chart-SECI-5" class="chart"></div>
     </div>
+
+    <div class="panel" data-plant="MSEDCL">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <div class="panel-title">MSEDCL 200MW</div>
+          <div class="range-picker-wrap">
+            <label>From</label>
+            <input type="date" id="from-MSEDCL" data-src="MSEDCL">
+            <label>To</label>
+            <input type="date" id="to-MSEDCL" data-src="MSEDCL">
+            <button class="today-btn" data-src="MSEDCL">Today</button>
+          </div>
+        </div>
+        <div class="panel-meta" id="meta-MSEDCL"></div>
+      </div>
+      <div class="stat-row" id="stats-MSEDCL"></div>
+      <div id="chart-MSEDCL" class="chart"></div>
+    </div>
   </div>
 
 <script>
-const SOURCES = ["SECI-3", "CNI", "SECI-5"];
+const SOURCES = ["SECI-3", "CNI", "SECI-5", "MSEDCL"];
 const COLORS = {
   hybrid: "#3d3a8c",
   hybridSoft: "rgba(61,58,140,0.10)",
   solar: "#e8910c",
   solarSoft: "rgba(232,145,12,0.10)",
   wind: "#0f9e95",
-  windSoft: "rgba(15,158,149,0.10)"
+  windSoft: "rgba(15,158,149,0.10)",
+  plantPower: "#7c3aed",
+  plantPowerSoft: "rgba(124,58,237,0.10)"
 };
 let selectedRanges = {};
 let refreshTimer = null;
@@ -942,13 +1114,23 @@ function lastVal(arr) {
 function renderStats(elId, data) {
   const el = document.getElementById(elId);
   if (!data.ok) { el.innerHTML = ""; return; }
-  const h = lastVal(data.hybrid), s = lastVal(data.solar), w = lastVal(data.wind);
-  const fmt = (v) => v === null ? "—" : v.toFixed(2) + " MW";
-  el.innerHTML = `
-    <div class="stat-chip"><span class="swatch" style="background:${COLORS.hybrid}"></span><span class="label">Hybrid (latest)</span><span class="value">${fmt(h)}</span></div>
-    <div class="stat-chip"><span class="swatch" style="background:${COLORS.solar}"></span><span class="label">Solar (latest)</span><span class="value">${fmt(s)}</span></div>
-    <div class="stat-chip"><span class="swatch" style="background:${COLORS.wind}"></span><span class="label">Wind (latest)</span><span class="value">${fmt(w)}</span></div>
-  `;
+  if (data.plant_power !== undefined) {
+    // MSEDCL: single series
+    const p = lastVal(data.plant_power);
+    const fmt = (v) => v === null ? "—" : v.toFixed(2) + " MW";
+    el.innerHTML = `
+      <div class="stat-chip"><span class="swatch" style="background:${COLORS.plantPower}"></span><span class="label">Plant Active Power (latest)</span><span class="value">${fmt(p)}</span></div>
+    `;
+  } else {
+    // XLS sources: Hybrid / Solar / Wind
+    const h = lastVal(data.hybrid), s = lastVal(data.solar), w = lastVal(data.wind);
+    const fmt = (v) => v === null ? "—" : v.toFixed(2) + " MW";
+    el.innerHTML = `
+      <div class="stat-chip"><span class="swatch" style="background:${COLORS.hybrid}"></span><span class="label">Hybrid (latest)</span><span class="value">${fmt(h)}</span></div>
+      <div class="stat-chip"><span class="swatch" style="background:${COLORS.solar}"></span><span class="label">Solar (latest)</span><span class="value">${fmt(s)}</span></div>
+      <div class="stat-chip"><span class="swatch" style="background:${COLORS.wind}"></span><span class="label">Wind (latest)</span><span class="value">${fmt(w)}</span></div>
+    `;
+  }
 }
 
 function renderChart(elId, data) {
@@ -958,32 +1140,51 @@ function renderChart(elId, data) {
     return;
   }
 
-  const traceHybrid = {
-    x: data.timestamps, y: data.hybrid,
-    name: "Hybrid Active Power [MW]",
-    mode: "lines+markers",
-    line: { color: COLORS.hybrid, width: 2.75, shape: "spline", smoothing: 0.6 },
-    marker: { size: 5, color: "#ffffff", line: { color: COLORS.hybrid, width: 2 } },
-    fill: "tozeroy",
-    fillcolor: COLORS.hybridSoft,
-    hovertemplate: "<b>%{y:.2f} MW</b><extra>Hybrid</extra>"
-  };
-  const traceSolar = {
-    x: data.timestamps, y: data.solar,
-    name: "Solar Active Power [MW]",
-    mode: "lines+markers",
-    line: { color: COLORS.solar, width: 2.25, shape: "spline", smoothing: 0.6 },
-    marker: { size: 4.5, color: "#ffffff", line: { color: COLORS.solar, width: 2 } },
-    hovertemplate: "<b>%{y:.2f} MW</b><extra>Solar</extra>"
-  };
-  const traceWind = {
-    x: data.timestamps, y: data.wind,
-    name: "Wind Active Power [MW]",
-    mode: "lines+markers",
-    line: { color: COLORS.wind, width: 2.25, shape: "spline", smoothing: 0.6 },
-    marker: { size: 4.5, color: "#ffffff", line: { color: COLORS.wind, width: 2 } },
-    hovertemplate: "<b>%{y:.2f} MW</b><extra>Wind</extra>"
-  };
+  let traces;
+
+  if (data.plant_power !== undefined) {
+    // MSEDCL: single series — Plant Active Power(MW)
+    traces = [{
+      x: data.timestamps, y: data.plant_power,
+      name: "Plant Active Power [MW]",
+      mode: "lines+markers",
+      line: { color: COLORS.plantPower, width: 2.75, shape: "spline", smoothing: 0.6 },
+      marker: { size: 5, color: "#ffffff", line: { color: COLORS.plantPower, width: 2 } },
+      fill: "tozeroy",
+      fillcolor: COLORS.plantPowerSoft,
+      hovertemplate: "<b>%{y:.2f} MW</b><extra>Plant Active Power</extra>"
+    }];
+  } else {
+    // SECI-3 / CNI / SECI-5: three series
+    traces = [
+      {
+        x: data.timestamps, y: data.hybrid,
+        name: "Hybrid Active Power [MW]",
+        mode: "lines+markers",
+        line: { color: COLORS.hybrid, width: 2.75, shape: "spline", smoothing: 0.6 },
+        marker: { size: 5, color: "#ffffff", line: { color: COLORS.hybrid, width: 2 } },
+        fill: "tozeroy",
+        fillcolor: COLORS.hybridSoft,
+        hovertemplate: "<b>%{y:.2f} MW</b><extra>Hybrid</extra>"
+      },
+      {
+        x: data.timestamps, y: data.solar,
+        name: "Solar Active Power [MW]",
+        mode: "lines+markers",
+        line: { color: COLORS.solar, width: 2.25, shape: "spline", smoothing: 0.6 },
+        marker: { size: 4.5, color: "#ffffff", line: { color: COLORS.solar, width: 2 } },
+        hovertemplate: "<b>%{y:.2f} MW</b><extra>Solar</extra>"
+      },
+      {
+        x: data.timestamps, y: data.wind,
+        name: "Wind Active Power [MW]",
+        mode: "lines+markers",
+        line: { color: COLORS.wind, width: 2.25, shape: "spline", smoothing: 0.6 },
+        marker: { size: 4.5, color: "#ffffff", line: { color: COLORS.wind, width: 2 } },
+        hovertemplate: "<b>%{y:.2f} MW</b><extra>Wind</extra>"
+      }
+    ];
+  }
 
   const layout = {
     margin: { t: 8, r: 16, l: 46, b: 36 },
@@ -991,6 +1192,7 @@ function renderChart(elId, data) {
     plot_bgcolor: "transparent",
     font: { color: "#16201c", size: 12, family: "Inter, sans-serif" },
     xaxis: {
+      type: "date",
       gridcolor: "#eef0eb", title: "", zerolinecolor: "#eef0eb",
       showspikes: true, spikemode: "across", spikecolor: "#c7ccc4", spikethickness: 1, spikedash: "dot",
       tickfont: { color: "#6b756f" }
@@ -1009,7 +1211,7 @@ function renderChart(elId, data) {
     transition: { duration: 350, easing: "cubic-in-out" }
   };
 
-  Plotly.newPlot(el, [traceHybrid, traceSolar, traceWind], layout, {
+  Plotly.newPlot(el, traces, layout, {
     responsive: true,
     displayModeBar: false
   });
@@ -1103,6 +1305,16 @@ def index():
 
 
 if __name__ == "__main__":
-    print("Starting dashboard at http://127.0.0.1:5000")
+    # On Render (and most cloud hosts), the PORT env var is set automatically
+    # and the app must bind to 0.0.0.0 to be reachable externally. Locally,
+    # with no PORT set, default to 127.0.0.1:5000 as before.
+    port_env = os.getenv("PORT")
+    if port_env:
+        host = "0.0.0.0"
+        port = int(port_env)
+    else:
+        host = os.getenv("HOST", "127.0.0.1")
+        port = int(os.getenv("PORT", "5000"))
+    print(f"Starting dashboard, binding to {host}:{port}")
     print(f"Auto-refresh every {POLL_INTERVAL_MINUTES} minute(s). Reading live from FTP — no local files saved.")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=host, port=port, debug=False)

@@ -51,5 +51,15 @@ services:
         sync: false
       - key: SECI5_REMOTE_DIR
         sync: false
+      - key: MSEDCL_HOST
+        sync: false
+      - key: MSEDCL_PORT
+        sync: false
+      - key: MSEDCL_USER
+        sync: false
+      - key: MSEDCL_PASS
+        sync: false
+      - key: MSEDCL_REMOTE_DIR
+        sync: false
       - key: POLL_INTERVAL_MINUTES
         value: "15"
