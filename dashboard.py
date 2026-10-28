@@ -410,42 +410,52 @@ def msedcl_filename_for_date(target_date: date) -> str:
 
 def parse_msedcl_csv(file_bytes: bytes) -> pd.DataFrame:
     """
-    Parse MSEDCL's daily CSV file into a DataFrame with columns:
-        timestamp, display_timestamp, plant_active_power_mw
-    File is latin-1 encoded (has degree symbol ° in a header), uses
-    Windows line endings (\r\n), and has no extra header/title row —
-    the very first line is the column header.
+    Robust parser for MSEDCL CSV files.
     """
-    df = pd.read_csv(
-        io.BytesIO(file_bytes),
-        encoding="latin-1",
-        sep=",",
-        skipinitialspace=True,
-    )
-    # Strip \r and whitespace from column names (Windows line endings)
-    df.columns = [c.strip().replace('\r', '') for c in df.columns]
+    import io
+    import pandas as pd
 
-    ts_col = "DateAndTime"
-    power_col = "Plant Active Power(MW)"
+    # Try normal header first
+    df = pd.read_csv(io.BytesIO(file_bytes), encoding="latin1", skip_blank_lines=True)
 
-    if ts_col not in df.columns:
-        raise ValueError(f"Timestamp column '{ts_col}' not found in CSV.")
-    if power_col not in df.columns:
-        raise ValueError(f"Column '{power_col}' not found in CSV.")
+    # If DateAndTime not present, search first 20 rows for header
+    if "DateAndTime" not in [str(c).strip() for c in df.columns]:
+        raw = pd.read_csv(io.BytesIO(file_bytes), encoding="latin1", header=None, on_bad_lines="skip")
+        header_idx=None
+        for i in range(min(20,len(raw))):
+            vals=[str(v).strip() for v in raw.iloc[i].tolist()]
+            if "DateAndTime" in vals:
+                header_idx=i
+                break
+        if header_idx is None:
+            raise ValueError("DateAndTime header not found")
+        df=raw.iloc[header_idx+1:].reset_index(drop=True)
+        df.columns=[str(v).strip() for v in raw.iloc[header_idx]]
 
-    df[ts_col] = df[ts_col].astype(str).str.strip().str.replace('\r', '')
-    timestamps = pd.to_datetime(df[ts_col], format="%d-%m-%Y %H:%M", errors="coerce")
-    power = pd.to_numeric(df[power_col], errors="coerce")
+    df.columns = [str(c).strip().replace("\r", "") for c in df.columns]
 
-    clean = pd.DataFrame({
-        "timestamp": timestamps,
-        "plant_active_power_mw": power,
-    })
-    clean = clean.dropna(subset=["timestamp"]).sort_values("timestamp")
-    clean["display_timestamp"] = clean["timestamp"] - timedelta(
-        minutes=TIMESTAMP_DISPLAY_OFFSET_MINUTES
-    )
+    ts_col=next((c for c in df.columns if "dateandtime" in c.lower()),None)
+    power_col=next((c for c in df.columns if "plant" in c.lower() and "active" in c.lower() and "power" in c.lower()),None)
+    if ts_col is None or power_col is None:
+        raise ValueError(f"Columns found: {list(df.columns)}")
+
+    raw_ts=df[ts_col].astype(str).str.strip().str.replace('"','',regex=False)
+    timestamps=pd.to_datetime(raw_ts,format="%d-%m-%Y %H:%M",errors="coerce")
+    if timestamps.notna().sum()==0:
+        timestamps=pd.to_datetime(raw_ts,dayfirst=True,errors="coerce")
+
+    power=pd.to_numeric(df[power_col],errors="coerce")
+
+    clean=pd.DataFrame({
+        "timestamp":timestamps,
+        "plant_active_power_mw":power
+    }).dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    clean["display_timestamp"]=clean["timestamp"]
+    print(f"MSEDCL parsed {len(clean)} rows")
     return clean
+
+
 
 
 def load_msedcl_range(from_date: date, to_date: date):
@@ -475,16 +485,24 @@ def load_msedcl_range(from_date: date, to_date: date):
 
         for d in days:
             fname = msedcl_filename_for_date(d)
-            if fname not in all_files:
-                warnings.append(f"No file found for {d.strftime('%d-%m-%Y')} (expected '{fname}')")
+            # ftp.nlst() sometimes returns full paths (/Date26-06-2026.csv)
+            # instead of bare filenames — match on basename only
+            all_basenames = {f.split("/")[-1]: f for f in all_files}
+            if fname not in all_basenames:
+                warnings.append(f"No file found for {d.strftime('%d-%m-%Y')} (expected '{fname}', server has: {list(all_basenames.keys())[:5]})")
                 continue
+            remote_fname = all_basenames[fname]
             try:
-                file_bytes = fetch_file_bytes(ftp, fname)
+                file_bytes = fetch_file_bytes(ftp, remote_fname)
                 day_df = parse_msedcl_csv(file_bytes)
-                frames.append(day_df)
-                files_used.append(fname)
+                if len(day_df) == 0:
+                    warnings.append(f"{remote_fname}: parsed OK but 0 rows returned")
+                else:
+                    frames.append(day_df)
+                    files_used.append(remote_fname)
             except Exception as e:
-                warnings.append(f"{fname}: {e}")
+                import traceback
+                warnings.append(f"{remote_fname}: {type(e).__name__}: {e}")
 
     finally:
         try:
@@ -519,6 +537,41 @@ def load_msedcl_range(from_date: date, to_date: date):
 # --------------------------------------------------------------------------
 # Diagnostics
 # --------------------------------------------------------------------------
+
+@app.route("/api/debug-msedcl")
+def api_debug_msedcl():
+    """
+    Lists all files currently on the MSEDCL FTP server.
+    Visit: http://127.0.0.1:5000/api/debug-msedcl
+    Use this to verify the exact filename format used by the server.
+    """
+    source = SOURCES["MSEDCL"]
+    try:
+        ftp = ftp_connect(source)
+    except Exception as e:
+        return jsonify({"error": f"Could not connect/login: {e}"}), 200
+    try:
+        all_files = ftp.nlst()
+        csv_files = sorted([f for f in all_files if f.lower().endswith(".csv")])
+        from datetime import date
+        today_expected = msedcl_filename_for_date(date.today())
+        today_basename = today_expected
+        basenames = [f.split("/")[-1] for f in all_files]
+        return jsonify({
+            "total_files": len(all_files),
+            "csv_files": csv_files,
+            "today_expected_filename": today_expected,
+            "today_found": today_basename in basenames,
+            "sample_raw_nlst": all_files[:10],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 200
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            ftp.close()
+
 
 @app.route("/api/debug-columns")
 def api_debug_columns():
@@ -1150,8 +1203,6 @@ function renderChart(elId, data) {
       mode: "lines+markers",
       line: { color: COLORS.plantPower, width: 2.75, shape: "spline", smoothing: 0.6 },
       marker: { size: 5, color: "#ffffff", line: { color: COLORS.plantPower, width: 2 } },
-      fill: "tozeroy",
-      fillcolor: COLORS.plantPowerSoft,
       hovertemplate: "<b>%{y:.2f} MW</b><extra>Plant Active Power</extra>"
     }];
   } else {
@@ -1193,12 +1244,27 @@ function renderChart(elId, data) {
     font: { color: "#16201c", size: 12, family: "Inter, sans-serif" },
     xaxis: {
       type: "date",
+      autorange: true,
       gridcolor: "#eef0eb", title: "", zerolinecolor: "#eef0eb",
       showspikes: true, spikemode: "across", spikecolor: "#c7ccc4", spikethickness: 1, spikedash: "dot",
-      tickfont: { color: "#6b756f" }
+      tickfont: { color: "#6b756f" },
+      rangeselector: {
+        buttons: [
+          { count: 1, label: "1D", step: "day", stepmode: "backward" },
+          { count: 7, label: "7D", step: "day", stepmode: "backward" },
+          { count: 1, label: "1M", step: "month", stepmode: "backward" },
+          { step: "all", label: "All" }
+        ],
+        bgcolor: "#f6f7f5",
+        activecolor: "#e4e7e2",
+        bordercolor: "#e4e7e2",
+        font: { color: "#16201c", size: 11 }
+      },
+      rangeslider: { visible: false }
     },
     yaxis: {
       gridcolor: "#eef0eb", title: "MW", zerolinecolor: "#dfe3dc",
+      rangemode: "normal",
       tickfont: { color: "#6b756f" },
       titlefont: { color: "#6b756f", size: 11 }
     },
@@ -1237,9 +1303,11 @@ async function refreshData() {
       const metaEl = document.getElementById("meta-" + src);
       if (data[src].ok) {
         const fileCount = (data[src].files_used || []).length;
-        metaEl.textContent = `${fileCount} day(s) · ${data[src].fetched_at}`;
+        const warns = (data[src].warnings || []);
+        const warnStr = warns.length ? ` ⚠ ${warns.join(" | ")}` : "";
+        metaEl.textContent = `${fileCount} day(s) · ${data[src].fetched_at}${warnStr}`;
       } else {
-        metaEl.textContent = "";
+        metaEl.textContent = data[src].error || "";
       }
     }
 

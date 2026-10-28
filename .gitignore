@@ -1,1 +1,7 @@
 .env
+pvt_key.pem
+
+*.pem
+*.key
+ampin_relay_key*
+power_summary.xlsx
